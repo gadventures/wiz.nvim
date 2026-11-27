@@ -1,0 +1,6 @@
+describe("wiz", function()
+  it("loads", function()
+    assert.is_table(require("wiz"))
+    assert.is_function(require("wiz").setup)
+  end)
+end)
