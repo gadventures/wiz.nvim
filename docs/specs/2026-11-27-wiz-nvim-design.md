@@ -1,60 +1,70 @@
 # wiz.nvim — Design Spec
 
-- **Status:** Approved design (2026-11-27) — implementation plan pending
+- **Status:** Approved design, **rev 2 (2026-11-27)**: hybrid wizcli + Wiz API
 - **Owner:** Frans Neyra
 - **Goal:** Bring the Wiz IDE experience (as in the Wiz VS Code extension) to Neovim/LazyVim: scan code for IaC misconfigurations, secrets, vulnerable dependencies, and container base images, and surface findings where developers work.
+
+## Revision history
+
+- **rev 1:** parse wizcli JSON output directly.
+- **rev 2:** wizcli v1.86's terminal output has no structured, explanatory results to parse. The plugin now uses wizcli only to *run and upload* the scan, then fetches structured results (descriptions, remediation, links) from the **Wiz GraphQL API** using the scan ID. Authentication for both is via environment variables.
 
 ## 1. Requirements (refined)
 
 | Area | Decision |
 |---|---|
-| Engine | Wrap the `wizcli` binary; parse its JSON output. No direct Wiz API calls. |
-| Auth | Reuse wizcli's own login (`wizcli auth`); plugin stores no credentials. |
-| wizcli install | Expected on `PATH` (or `wizcli_path`); `:checkhealth wiz` reports missing/old/unauthenticated. |
+| Engine | **Hybrid.** `wizcli scan dir` / `wizcli scan container-image` runs the scan and uploads it to Wiz. The plugin extracts the scan ID and queries the Wiz GraphQL API for structured results. |
+| Auth | Env vars only; the plugin stores nothing. `WIZ_CLIENT_ID`, `WIZ_CLIENT_SECRET` (shared by wizcli and the API), `WIZ_API_ENDPOINT` (e.g. `https://api.us17.app.wiz.io/graphql`), optional `WIZ_AUTH_URL` (default `https://auth.app.wiz.io/oauth/token`) and `WIZ_AUTH_AUDIENCE` (default `wiz-api`). |
+| wizcli | v1.x (`wizcli scan …` syntax), expected on `PATH` or set with `wizcli_path`. |
 | Scan types (v1) | IaC misconfigs, secrets, vulnerabilities (SCA), container base images. |
-| Triggers | On save (current file), on-demand commands, once on project open, git pre-commit hook helper. |
-| Image scans | On demand only (`:Wiz scan image` from a Dockerfile). Never automatic. |
-| UI | `vim.diagnostic` (works with `]d`/`[d`, Trouble), picker list, details float. |
+| Triggers | On save (current file, **opt-in**), on-demand commands, once on project open, git pre-commit hook helper. |
+| Image scans | On demand only (`:Wiz scan image` from a Dockerfile). |
+| UI | `vim.diagnostic`, picker list, details float. |
 | Picker | Auto-detect: Snacks → fzf-lua → Telescope → `vim.ui.select`. |
 | Extras (v1) | Severity threshold, ignore findings, lualine statusline counts, open in Wiz portal. |
-| Distribution | Standalone GitHub repo (`wiz.nvim`), installed via a lazy.nvim spec; LazyVim extra later. |
-| Keymaps | `<leader>z` prefix (configurable / disableable). |
-| Out of scope v1 | Disk cache of results (v1.1), SAST, auto-download of wizcli, Mason package, AI fix suggestions. |
+| Distribution | `gadventures/wiz.nvim` (private) via a lazy.nvim spec. |
+| Keymaps | `<leader>z` prefix. |
+| Out of scope v1 | Disk cache (v1.1), "what Wiz Code already reports for this repo" view (v1.1, since the GitHub org is connected to Wiz Code), SAST, wizcli auto-install. |
+
+**Why on-save is opt-in:** every wizcli scan is uploaded to the G Adventures Wiz tenant and takes a network round-trip. Scanning on every save would flood the tenant's CI/CD scan history and be slow. Users can enable it with `scan_on_save = true` (debounced).
 
 ## 2. Approach
 
-**A — Lua-native wrapper around wizcli** (chosen). Pure Lua; async jobs via `vim.system`; one normalized findings store that feeds every UI surface. Rejected: nvim-lint/none-ls source (can't do project scans, picker, details, ignore, auth); disk cache deferred to v1.1.
+Pure Lua, no extra Lua dependencies. External processes: `wizcli` and `curl`, both run with `vim.system` (async). One normalized findings store feeds every UI surface.
 
-Minimum Neovim: **0.10** (for `vim.system`, `vim.ui.open`, modern diagnostics API).
+Minimum Neovim: **0.10**.
 
 ## 3. Architecture
 
 ```
 lua/wiz/
   init.lua          -- setup(), public API
-  config.lua        -- defaults + validation (vim.validate)
-  cli.lua           -- locate wizcli, detect version, build argv, run async (cancel/timeout)
-  parser.lua        -- wizcli JSON -> Finding[]
-  store.lua         -- findings by file, scan state, change events
+  config.lua        -- defaults + validation
+  env.lua           -- read + validate WIZ_* env vars (never logs values)
+  http.lua          -- async curl wrapper; secrets passed on stdin, never argv
+  auth.lua          -- OAuth client-credentials token, cached in memory until expiry
+  api.lua           -- GraphQL request, pagination, 401 → refresh once
+  queries.lua       -- GraphQL query strings (verified in the discovery spike)
+  cli.lua           -- run wizcli scans, cancel/timeout, extract scan ID
+  parser.lua        -- API scan result → wiz.Finding[]
+  scan.lua          -- orchestrator: cli → scan ID → poll API → parse → store
+  store.lua         -- findings by scope, filters (ignore, min_severity), events
   diagnostics.lua   -- vim.diagnostic namespace "wiz"
-  picker/init.lua   -- backend auto-detect
-  picker/{snacks,fzf,telescope,select}.lua
+  picker/           -- init.lua (auto-detect) + snacks/fzf/telescope/select
   details.lua       -- float with full finding details
-  ignore.lua        -- ignore rules (load/match/add)
+  ignore.lua        -- .wiz-nvim-ignore.json load/match/add
   statusline.lua    -- lualine component
   hook.lua          -- pre-commit hook installer
-  autocmds.lua      -- BufWritePost / VimEnter triggers
-  commands.lua      -- :Wiz user command + completion
-  health.lua        -- :checkhealth wiz
-plugin/wiz.lua      -- lazy-load guard
-tests/              -- plenary/busted specs + JSON fixtures + fake wizcli
+  autocmds.lua, commands.lua, keymaps.lua, health.lua
+plugin/wiz.lua
+tests/              -- plenary/busted specs, API fixtures, fake wizcli + fake curl
 ```
 
 ### Normalized Finding
 
 ```lua
 ---@class wiz.Finding
----@field id string          -- stable fingerprint: rule_id|file|lnum|hash(title)
+---@field id string          -- fingerprint: rule_id|file|lnum|hash(title)
 ---@field type "iac"|"secret"|"vuln"|"image"
 ---@field severity "CRITICAL"|"HIGH"|"MEDIUM"|"LOW"|"INFO"
 ---@field title string
@@ -73,93 +83,91 @@ tests/              -- plenary/busted specs + JSON fixtures + fake wizcli
 
 ## 4. Data flow
 
-1. Trigger (autocmd, command, or VimEnter) → `cli.scan({ kind, path })`.
-2. `cli` builds argv for the detected wizcli version, runs it with `vim.system` (cwd = project root, JSON to stdout or a temp file).
-3. On exit, `parser.parse(json, kind)` → `Finding[]`. Exit codes that indicate "policy failed" but produced JSON are treated as success.
-4. `store.replace(scope, findings)` — scope is a file path or the project root.
-5. `store` applies `ignore` + `min_severity` filters, then notifies: `diagnostics.refresh(bufnrs)`, statusline redraw, `User WizScanDone` autocmd.
+1. Trigger → `scan.run({ kind = "dir"|"image", target })`.
+2. `cli` runs `wizcli scan dir <path>` (or `scan container-image <image>`) with the `WIZ_*` env passed through, cwd = project root.
+3. `cli` extracts the **scan ID** from wizcli's output (the results URL it prints; exact pattern confirmed in the discovery spike).
+4. `scan` polls `api` for that scan until it's complete (backoff 1s → 5s, capped by `timeout_ms`).
+5. `parser` maps the API result to `Finding[]`, resolving file paths relative to the scanned root.
+6. `store.replace(scope, findings)` → filters → `diagnostics.refresh`, statusline redraw, `User WizScanDone`.
 
-**On-save scans:** debounced (~1000 ms); an in-flight scan for the same file is cancelled; only for supported filetypes/patterns (`*.tf`, `*.tfvars`, `*.yaml/yml` (k8s/CFN/Helm), `*.json` (CFN/ARM), `Dockerfile*`, `*.bicep`, lockfiles/manifests); any file for secrets.
-**Project-open scan:** once per git root per session, only if `scan_on_open = true` and wizcli is authenticated.
+Concurrency: at most one project scan and one scan per file at a time; a new scan of the same scope cancels the older one.
 
-## 5. Commands & keymaps
+## 5. Auth & API
+
+- Token: `POST WIZ_AUTH_URL` with `grant_type=client_credentials&client_id=…&client_secret=…&audience=…` (form-encoded). The **body is passed to curl on stdin** (`--data @-`), so secrets never appear in the process list.
+- Tokens are cached in memory with their expiry (refreshed 5 minutes early). On HTTP 401 the plugin refreshes once and retries.
+- GraphQL: `POST WIZ_API_ENDPOINT` with `Authorization: Bearer <token>`, passed to curl through a config on stdin (`-K -`), never argv.
+- The service account needs read scopes for scan results (exact scopes confirmed in the spike; likely the same account wizcli uses).
+
+## 6. Commands & keymaps
 
 | Command | Keymap | Action |
 |---|---|---|
 | `:Wiz scan file` | `<leader>zs` | Scan current file |
 | `:Wiz scan project` | `<leader>zS` | Scan git root / cwd |
-| `:Wiz scan image` | `<leader>zi` | Scan base image(s) of current Dockerfile |
+| `:Wiz scan image` | `<leader>zi` | Scan base image(s) in current Dockerfile |
 | `:Wiz findings [severity]` | `<leader>zf` | Picker of all findings |
 | `:Wiz details` | `<leader>zd` | Float for finding(s) under cursor |
 | `:Wiz ignore` | `<leader>zx` | Ignore finding under cursor (with reason) |
-| `:Wiz open` | `<leader>zo` | Open finding/policy in browser (`vim.ui.open`) |
-| `:Wiz auth` | `<leader>za` | Run `wizcli auth` in a terminal split |
+| `:Wiz open` | `<leader>zo` | Open finding / scan in Wiz portal |
 | `:Wiz install-hook` | — | Install git pre-commit hook |
 | `:Wiz clear` | `<leader>zc` | Clear findings |
-| `:checkhealth wiz` | — | Health report |
+| `:checkhealth wiz` | — | Env vars set, token fetch OK, API reachable, wizcli version |
 
-## 6. Configuration (defaults)
+## 7. Configuration (defaults)
 
 ```lua
 {
   wizcli_path = "wizcli",
-  extra_args = {},              -- e.g. { "--policy", "Default IaC policy" }
-  scan_types = { "iac", "secret", "vuln" },  -- "image" only via command
-  scan_on_save = true,
+  wizcli_args = {},             -- extra args for every scan, e.g. policy flags
+  scan_types = { "iac", "secret", "vuln" },
+  scan_on_save = false,         -- opt-in: each scan uploads to Wiz
   scan_on_open = true,
-  debounce_ms = 1000,
-  timeout_ms = 120000,
+  debounce_ms = 2000,
+  timeout_ms = 300000,
+  poll = { initial_ms = 1000, max_ms = 5000 },
   min_severity = "LOW",
+  env = {                       -- env var NAMES (not values)
+    client_id = "WIZ_CLIENT_ID",
+    client_secret = "WIZ_CLIENT_SECRET",
+    api_endpoint = "WIZ_API_ENDPOINT",
+    auth_url = "WIZ_AUTH_URL",
+    audience = "WIZ_AUTH_AUDIENCE",
+  },
   diagnostics = { virtual_text = true, signs = true, underline = true },
-  picker = "auto",              -- "snacks" | "fzf" | "telescope" | "select"
-  portal_url = nil,             -- e.g. "https://app.wiz.io"
+  picker = "auto",
+  portal_url = "https://app.wiz.io",
   ignore_file = ".wiz-nvim-ignore.json",
-  keymaps = { prefix = "<leader>z" },  -- false to disable
-  statusline = { icons = { CRITICAL = "", HIGH = "", MEDIUM = "", LOW = "" } },
+  keymaps = { prefix = "<leader>z" },
 }
 ```
-
-LazyVim spec:
-
-```lua
-{
-  "gadventures/wiz.nvim",
-  cmd = "Wiz",
-  event = { "BufReadPost", "BufWritePost" },
-  opts = { min_severity = "MEDIUM" },
-}
-```
-
-## 7. Ignore
-
-- Default: project file `.wiz-nvim-ignore.json` (`[{ rule_id, path_glob, fingerprint?, reason, author, date }]`), committed to the repo so the team shares it.
-- If wizcli supports native inline/file ignores (to verify), prefer those and treat the JSON file as a fallback.
 
 ## 8. Error handling & safety
 
-- wizcli missing / unauthenticated / unsupported version → one actionable `vim.notify` per session + `:checkhealth` detail.
-- Timeout → cancel job, notify, keep previous findings marked stale.
-- Malformed JSON → log a parse error with the first N chars **with secret-like strings redacted**; never log raw wizcli output to `:messages` or files.
-- Never write secret values into diagnostics text — use wizcli's redacted snippet or the rule title only.
-- Concurrency: at most one project scan + one scan per file at a time.
+- Missing env vars → one notification naming the missing variable(s), never their values.
+- Token failure (401/403) → "check WIZ_CLIENT_ID/SECRET and service account scopes".
+- wizcli non-zero exit **with** a scan ID → still fetch results (policy failures exit non-zero).
+- No scan ID found → error with the last few lines of wizcli output, redacted.
+- Poll timeout → keep previous findings, mark stale, notify.
+- Never log tokens, secrets, raw API bodies, or secret snippets. Redaction helper applied to every error message.
 
 ## 9. Testing
 
-- **Unit (plenary/busted, headless nvim):** parser against recorded fixtures for each scan type (use DefectDojo's public wizcli dir-scan samples as a starting point, then real anonymized output), config validation, severity filter, ignore matching, fingerprinting.
-- **Integration:** `tests/bin/wizcli` fake script that emits fixtures/exit codes; tests drive `:Wiz scan` and assert diagnostics.
-- **CI:** GitHub Actions matrix on Neovim stable + nightly; stylua + luacheck/selene.
+- Unit (plenary/busted, headless): config, env validation, token caching/expiry, GraphQL error mapping, scan-ID extraction, parser (fixtures recorded in the spike, anonymized), store filters, ignore matching.
+- Integration: `tests/bin/wizcli` and `tests/bin/curl` fakes on `PATH`; drive `:Wiz scan project` end to end and assert diagnostics.
+- CI: GitHub Actions on Neovim stable + nightly; stylua + selene.
 
-## 10. Open questions (verify against the installed wizcli version)
+## 10. Open questions (answered by the discovery spike, plan Task 1)
 
-1. Exact subcommands/flags: legacy `wizcli dir scan --path . -f json` / `wizcli iac scan` / `wizcli docker scan --image` vs newer `wizcli scan dir` / `wizcli scan container-image`. → `cli` will detect version and map accordingly.
-2. Can wizcli scan a single file, or only a directory? (If dir-only: scan parent dir with file filter, or project scan + filter.)
-3. JSON output schema per scan type (line numbers, rule IDs, portal links).
-4. Native ignore mechanism, if any.
-5. Portal deep-link URL format.
-6. Whether scans upload results to Wiz by default and whether a no-publish flag exists (privacy / noise).
+1. Exact text/URL wizcli prints that contains the scan ID.
+2. GraphQL query (and fields) that returns a CLI scan's results by ID, and its status values.
+3. Whether `wizcli scan dir` accepts a single file path.
+4. Required service-account scopes.
+5. Portal deep-link format for a scan and for a finding/rule.
+6. Native ignore support in wizcli/Wiz policies.
 
 ## 11. Roadmap
 
 - **v1.0:** everything above.
-- **v1.1:** disk cache keyed by git HEAD + file hash; LazyVim extra PR.
-- **Later:** SAST if wizcli supports it; code actions for dependency bumps; Mason registry entry.
+- **v1.1:** "Repo findings" view from Wiz Code (latest default-branch findings for the current repo); disk cache.
+- **Later:** code actions for dependency bumps; LazyVim extra.
